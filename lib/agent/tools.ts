@@ -3,81 +3,183 @@ import { z } from "zod";
 import { defineTool, type AgentTool } from "./defineTool";
 import { getSupabase } from "../supabase";
 import { isoDate } from "../schemas";
+import { CURRENT_USER_ID } from "../currentUser";
 
-/*
- * EXAMPLE TOOLS for the starter "tasks" table (seed/00_starter_example.sql).
- * They show the pattern: 1 read tool + 2 write tools.
- *
- * YOUR JOB: replace these with tools for your problem statement.
- * Tips:
- *  - Write the description as "Use this when ..." so Gemini knows WHEN to call it.
- *  - Describe every field, including its format (for example YYYY-MM-DD).
- *  - Return small, clean objects. Gemini reads what you return.
- *  - Throw an Error with a clear message when something is wrong. The agent will explain it.
- */
+const MAX_RESULTS = 20;
 
-const listTasks = defineTool({
-  name: "listTasks",
+/** Normalizes a Supabase joined relation that may be returned as an object or single-element array. */
+function unwrapJoin<T>(relation: T | T[] | null | undefined): T | null {
+  if (!relation) return null;
+  return Array.isArray(relation) ? (relation[0] ?? null) : relation;
+}
+
+function includesLanguage(languages: string[] | null | undefined, target: string): boolean {
+  const needle = target.trim().toLowerCase();
+  if (!needle) return true;
+  return (languages ?? []).some((lang) => lang.toLowerCase() === needle);
+}
+
+const searchDoctors = defineTool({
+  name: "searchDoctors",
   description:
-    "Use this when the user wants to see their tasks. Can filter by status. Returns at most 20 tasks, newest first.",
+    "Use this when the patient asks about doctors, departments, symptoms, or languages spoken. Can filter by symptomOrDepartment and/or language. Returns at most 20 matching doctors.",
   schema: z.object({
-    status: z
-      .enum(["open", "done", "all"])
+    symptomOrDepartment: z
+      .string()
+      .trim()
+      .min(1)
       .optional()
-      .describe("Which tasks to return. Default is all."),
+      .describe("Symptom, health issue, department name, or doctor name to search for"),
+    language: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Preferred language spoken by the doctor (for example Tamil, Hindi, English)"),
   }),
-  run: async ({ status }) => {
+  run: async ({ symptomOrDepartment, language }) => {
+    const { data, error } = await getSupabase()
+      .from("doctors")
+      .select(
+        "id, name, qualification, experience_years, consultation_fee, languages, room, departments(name, common_issues)"
+      )
+      .order("id", { ascending: true });
+
+    if (error) throw new Error(error.message);
+
+    const query = symptomOrDepartment?.trim().toLowerCase();
+
+    const doctors = (data ?? [])
+      .map((doc) => {
+        const dept = unwrapJoin(doc.departments);
+        return {
+          id: doc.id,
+          name: doc.name,
+          department: dept?.name ?? null,
+          common_issues: dept?.common_issues ?? "",
+          qualification: doc.qualification,
+          experience_years: doc.experience_years,
+          consultation_fee: doc.consultation_fee,
+          languages: doc.languages,
+          room: doc.room,
+        };
+      })
+      .filter((doc) => {
+        if (query) {
+          const matchesQuery =
+            doc.name.toLowerCase().includes(query) ||
+            (doc.department ?? "").toLowerCase().includes(query) ||
+            doc.common_issues.toLowerCase().includes(query);
+          if (!matchesQuery) return false;
+        }
+        if (language && !includesLanguage(doc.languages, language)) {
+          return false;
+        }
+        return true;
+      })
+      .slice(0, MAX_RESULTS)
+      .map(({ common_issues: _commonIssues, ...rest }) => rest);
+
+    return { count: doctors.length, doctors };
+  },
+});
+
+const getAvailableSlots = defineTool({
+  name: "getAvailableSlots",
+  description:
+    "Use this when the patient wants to check available appointment slots. Can filter by doctorId, date (YYYY-MM-DD), and/or language. Returns at most 20 upcoming open slots.",
+  schema: z.object({
+    doctorId: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Doctor ID to filter slots by (for example DR01)"),
+    date: isoDate
+      .optional()
+      .describe("Specific appointment date in YYYY-MM-DD format"),
+    language: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Preferred language spoken by the doctor"),
+  }),
+  run: async ({ doctorId, date, language }) => {
+    const today = new Date().toISOString().slice(0, 10);
+
     let query = getSupabase()
-      .from("tasks")
-      .select("id, title, due_date, status")
-      .order("created_at", { ascending: false })
-      .limit(20);
-    if (status && status !== "all") query = query.eq("status", status);
+      .from("slots")
+      .select("id, doctor_id, slot_date, start_time, doctors(name, department_id, languages, room)")
+      .eq("is_booked", false)
+      .gte("slot_date", today)
+      .order("slot_date", { ascending: true })
+      .order("start_time", { ascending: true });
+
+    if (doctorId) query = query.eq("doctor_id", doctorId);
+    if (date) query = query.eq("slot_date", date);
+    if (!language) query = query.limit(MAX_RESULTS);
+
     const { data, error } = await query;
     if (error) throw new Error(error.message);
-    return { count: data.length, tasks: data };
+
+    const slots = (data ?? [])
+      .map((slot) => {
+        const doc = unwrapJoin(slot.doctors);
+        return {
+          id: slot.id,
+          doctor_id: slot.doctor_id,
+          doctor_name: doc?.name ?? null,
+          room: doc?.room ?? null,
+          slot_date: slot.slot_date,
+          start_time: slot.start_time,
+          _languages: doc?.languages ?? [],
+        };
+      })
+      .filter((slot) => !language || includesLanguage(slot._languages, language))
+      .slice(0, MAX_RESULTS)
+      .map(({ _languages, ...rest }) => rest);
+
+    return { count: slots.length, slots };
   },
 });
 
-const createTask = defineTool({
-  name: "createTask",
-  description: "Use this when the user asks to add, create or remember a new task.",
-  writes: true,
-  schema: z.object({
-    title: z.string().trim().min(1).max(200).describe("Short title of the task"),
-    due_date: isoDate.optional().describe("Due date in YYYY-MM-DD format, if the user gave one"),
-  }),
-  run: async ({ title, due_date }) => {
-    const { data, error } = await getSupabase()
-      .from("tasks")
-      .insert({ title, due_date: due_date ?? null })
-      .select("id, title, due_date, status")
-      .single();
-    if (error) throw new Error(error.message);
-    return { created: data };
-  },
-});
-
-const completeTask = defineTool({
-  name: "completeTask",
+const getMyAppointments = defineTool({
+  name: "getMyAppointments",
   description:
-    "Use this when the user says a task is finished. Needs the task id, so call listTasks first if you do not know it.",
-  writes: true,
-  schema: z.object({
-    id: z.number().int().positive().describe("The id of the task"),
-  }),
-  run: async ({ id }) => {
+    "Use this when the patient wants to view their own booked, cancelled, or completed appointments. Returns at most 20 appointments, newest first.",
+  schema: z.object({}),
+  run: async () => {
     const { data, error } = await getSupabase()
-      .from("tasks")
-      .update({ status: "done" })
-      .eq("id", id)
-      .select("id, title, status")
-      .maybeSingle();
+      .from("appointments")
+      .select(
+        "id, doctor_id, slot_id, reason, status, doctors(name, department_id, room, consultation_fee), slots(slot_date, start_time)"
+      )
+      .eq("patient_id", CURRENT_USER_ID)
+      .order("created_at", { ascending: false })
+      .limit(MAX_RESULTS);
+
     if (error) throw new Error(error.message);
-    if (!data) throw new Error(`No task found with id ${id}`);
-    return { updated: data };
+
+    const appointments = (data ?? []).map((appt) => {
+      const doc = unwrapJoin(appt.doctors);
+      const slot = unwrapJoin(appt.slots);
+      return {
+        id: appt.id,
+        doctor_id: appt.doctor_id,
+        doctor_name: doc?.name ?? null,
+        room: doc?.room ?? null,
+        slot_id: appt.slot_id,
+        slot_date: slot?.slot_date ?? null,
+        start_time: slot?.start_time ?? null,
+        reason: appt.reason,
+        status: appt.status,
+      };
+    });
+
+    return { count: appointments.length, appointments };
   },
 });
 
-/** Every tool in this list is given to Gemini. Add your own tools here. */
-export const tools: AgentTool[] = [listTasks, createTask, completeTask];
+/** Every tool in this list is given to Gemini. */
+export const tools: AgentTool[] = [searchDoctors, getAvailableSlots, getMyAppointments];
